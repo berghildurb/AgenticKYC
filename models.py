@@ -31,3 +31,4 @@ class Submission:
     status: str = "pending"
     risk_brief: Optional[dict] = None
     decision: Optional[dict] = None
+    dispute: Optional[dict] = None

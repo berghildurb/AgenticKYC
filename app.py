@@ -1,9 +1,12 @@
+import time
+
 import streamlit as st
 from datetime import date, datetime, timezone
 
-from agent import run_analysis
+from agent import run_analysis, review_dispute
 from models import Submission
 from storage import load_all_submissions, load_submission, save_submission, update_submission
+from synthetic_profiles import SYNTHETIC_PROFILES
 
 st.set_page_config(page_title="KYC Intelligence Platform", layout="wide")
 
@@ -12,7 +15,7 @@ st.set_page_config(page_title="KYC Intelligence Platform", layout="wide")
 st.markdown("""
 <style>
 .stApp { background: #f8fafc; }
-.block-container { padding: 1.5rem 3rem 4rem !important; }
+.block-container { padding: 3rem 3rem 4rem !important; }
 hr { border: none !important; border-top: 1px solid #e2e8f0 !important; margin: 2rem 0 !important; }
 .stButton > button { border-radius: 8px !important; font-weight: 600 !important; font-size: 0.875rem !important; }
 .stButton > button[kind="primary"] { background: #0f172a !important; color: white !important; border: none !important; }
@@ -72,134 +75,317 @@ def fmt_ts(iso: str) -> str:
 
 if "selected_id" not in st.session_state:
     st.session_state.selected_id = None
+if "customer_view" not in st.session_state:
+    st.session_state.customer_view = "home"  # home | new_application | check_status
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 page = st.sidebar.radio("Navigation", ["Customer Onboarding", "Analyst Dashboard"])
 
+if page == "Analyst Dashboard" and st.session_state.customer_view != "home":
+    st.session_state.customer_view = "home"
+    st.session_state.pop("_looked_up_id", None)
+
+st.sidebar.divider()
+if st.sidebar.button("⚡ Generate Test Submissions", use_container_width=True):
+    st.session_state["_do_generate"] = True
+
 # ── Product header ────────────────────────────────────────────────────────────
 
 _header_title = "KYC Intelligence Platform" if page == "Customer Onboarding" else "Compliance Review System"
 st.markdown(f"""
 <div style="display:flex;align-items:center;gap:12px;padding-bottom:24px;
-            margin-bottom:8px;border-bottom:1px solid #e2e8f0">
-    <div style="width:32px;height:32px;background:#0f172a;border-radius:8px;
+            margin-bottom:8px;border-bottom:1px solid #e2e8f0;background:#f8fafc">
+    <div style="width:32px;height:32px;background:#2563eb;border-radius:8px;
                 display:flex;align-items:center;justify-content:center;flex-shrink:0">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <rect x="2"   y="2"   width="5.5" height="5.5" rx="1.5" fill="white"/>
-            <rect x="8.5" y="2"   width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.5"/>
-            <rect x="2"   y="8.5" width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.5"/>
-            <rect x="8.5" y="8.5" width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.25"/>
+            <rect x="8.5" y="2"   width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.7"/>
+            <rect x="2"   y="8.5" width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.7"/>
+            <rect x="8.5" y="8.5" width="5.5" height="5.5" rx="1.5" fill="white" opacity="0.4"/>
         </svg>
     </div>
     <div style="font-size:15px;font-weight:700;color:#0f172a;letter-spacing:-0.3px">{_header_title}</div>
 </div>
 """, unsafe_allow_html=True)
 
+# ── Synthetic stress test ─────────────────────────────────────────────────────
+
+if st.session_state.pop("_do_generate", False):
+    st.subheader("Generating test submissions…")
+    progress_bar = st.progress(0)
+    status       = st.empty()
+
+    for i, profile_data in enumerate(SYNTHETIC_PROFILES):
+        name = profile_data["full_name"]
+        status.info(f"Analysing {i + 1} of 5 — **{name}**")
+        progress_bar.progress(i / 5)
+
+        sub = Submission(**profile_data)
+        save_submission(sub)
+        try:
+            run_analysis(sub.id)
+        except Exception as e:
+            st.warning(f"Analysis failed for {name}: {e}")
+
+        progress_bar.progress((i + 1) / 5)
+
+    status.success("All 5 submissions generated and analysed. Loading dashboard…")
+    time.sleep(1.5)
+    st.session_state.selected_id = None          # land on the list view
+    st.session_state["_goto_dashboard"] = True   # switch page after rerun
+    st.rerun()
+
+if st.session_state.pop("_goto_dashboard", False):
+    # Force navigation to the analyst dashboard after generation
+    page = "Analyst Dashboard"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CUSTOMER ONBOARDING
 # ─────────────────────────────────────────────────────────────────────────────
 
 if page == "Customer Onboarding":
-    st.title("Customer Onboarding")
-    st.write(
-        "Please complete all fields accurately. "
-        "Incomplete or false information may result in your application being declined."
-    )
 
-    with st.form("kyc_form", clear_on_submit=True):
-        st.subheader("Personal Information")
-        full_name            = st.text_input("Full Legal Name")
-        date_of_birth        = st.date_input(
-            "Date of Birth",
-            value=date(1990, 1, 1),
-            min_value=date(1900, 1, 1),
-            max_value=date.today(),
-        )
-        nationality          = st.text_input("Nationality")
-        country_of_birth     = st.text_input("Country of Birth")
-        country_of_residence = st.text_input("Country of Residence")
+    # Reset customer_view when navigating away and back
+    cv = st.session_state.customer_view
 
-        st.subheader("Employment & Finances")
-        occupation                  = st.text_input("Occupation / Job Title")
-        employer                    = st.text_input("Employer or Business Name")
-        source_of_funds             = st.text_area(
-            "Source of Funds",
-            placeholder=(
-                "Describe how you obtained the funds you intend to use — "
-                "e.g. salary, business income, inheritance, sale of property."
-            ),
-            height=100,
-        )
-        expected_transaction_volume = st.selectbox(
-            "Expected Monthly Transaction Volume",
-            ["Under €1,000", "€1,000 – €10,000", "€10,000 – €50,000",
-             "€50,000 – €100,000", "Over €100,000"],
+    # ── Home: choose a path ───────────────────────────────────────────────────
+
+    if cv == "home":
+        st.title("Welcome")
+        st.write("What would you like to do?")
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+
+        col_a, col_b = st.columns(2, gap="large")
+        with col_a:
+            st.markdown("""
+            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;
+                        padding:28px 24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);min-height:140px">
+                <div style="font-size:1.1rem;font-weight:700;color:#0f172a;margin-bottom:8px">New Application</div>
+                <div style="color:#64748b;font-size:0.9rem;line-height:1.5">
+                    Complete the KYC onboarding form to open an account.
+                    You will receive a reference ID when you submit.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+            if st.button("Start Application", type="primary", use_container_width=True):
+                st.session_state.customer_view = "new_application"
+                st.rerun()
+
+        with col_b:
+            st.markdown("""
+            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;
+                        padding:28px 24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);min-height:140px">
+                <div style="font-size:1.1rem;font-weight:700;color:#0f172a;margin-bottom:8px">Check My Application</div>
+                <div style="color:#64748b;font-size:0.9rem;line-height:1.5">
+                    View the status of an existing application or file a dispute
+                    if your application was rejected.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+            if st.button("Check Status", use_container_width=True):
+                st.session_state.customer_view = "check_status"
+                st.rerun()
+
+    # ── New application form ──────────────────────────────────────────────────
+
+    elif cv == "new_application":
+        if st.button("← Back"):
+            st.session_state.customer_view = "home"
+            st.rerun()
+
+        st.title("New Application")
+        st.write(
+            "Please complete all fields accurately. "
+            "Incomplete or false information may result in your application being declined."
         )
 
-        st.subheader("Compliance Declarations")
-        pep_raw = st.radio(
-            "Are you, or have you ever been, a Politically Exposed Person (PEP)?",
-            ["No", "Yes"],
-            help=(
-                "A PEP is someone who holds or has held a prominent public position, "
-                "or is a close associate of such a person."
-            ),
-        )
-        beneficial_ownership = st.text_area(
-            "Beneficial Ownership",
-            placeholder=(
-                "Are you acting on behalf of another person or entity? "
-                "If yes, provide their full name, relationship, and reason."
-            ),
-            height=100,
-        )
+        with st.form("kyc_form", clear_on_submit=True):
+            st.subheader("Personal Information")
+            full_name            = st.text_input("Full Legal Name")
+            date_of_birth        = st.date_input(
+                "Date of Birth",
+                value=date(1990, 1, 1),
+                min_value=date(1900, 1, 1),
+                max_value=date.today(),
+            )
+            nationality          = st.text_input("Nationality")
+            country_of_birth     = st.text_input("Country of Birth")
+            country_of_residence = st.text_input("Country of Residence")
 
-        submitted = st.form_submit_button("Submit Application", type="primary")
+            st.subheader("Employment & Finances")
+            occupation                  = st.text_input("Occupation / Job Title")
+            employer                    = st.text_input("Employer or Business Name")
+            source_of_funds             = st.text_area(
+                "Source of Funds",
+                placeholder=(
+                    "Describe how you obtained the funds you intend to use — "
+                    "e.g. salary, business income, inheritance, sale of property."
+                ),
+                height=100,
+            )
+            expected_transaction_volume = st.selectbox(
+                "Expected Monthly Transaction Volume",
+                ["Under €1,000", "€1,000 – €10,000", "€10,000 – €50,000",
+                 "€50,000 – €100,000", "Over €100,000"],
+            )
 
-    if submitted:
-        missing = [
-            label for label, val in [
-                ("Full Legal Name",      full_name),
-                ("Nationality",          nationality),
-                ("Country of Birth",     country_of_birth),
-                ("Country of Residence", country_of_residence),
-                ("Occupation",           occupation),
-                ("Employer",             employer),
-                ("Source of Funds",      source_of_funds),
-                ("Beneficial Ownership", beneficial_ownership),
+            st.subheader("Compliance Declarations")
+            pep_raw = st.radio(
+                "Are you, or have you ever been, a Politically Exposed Person (PEP)?",
+                ["No", "Yes"],
+                help=(
+                    "A PEP is someone who holds or has held a prominent public position, "
+                    "or is a close associate of such a person."
+                ),
+            )
+            beneficial_ownership = st.text_area(
+                "Beneficial Ownership",
+                placeholder=(
+                    "Are you acting on behalf of another person or entity? "
+                    "If yes, provide their full name, relationship, and reason."
+                ),
+                height=100,
+            )
+
+            submitted = st.form_submit_button("Submit Application", type="primary")
+
+        if submitted:
+            missing = [
+                label for label, val in [
+                    ("Full Legal Name",      full_name),
+                    ("Nationality",          nationality),
+                    ("Country of Birth",     country_of_birth),
+                    ("Country of Residence", country_of_residence),
+                    ("Occupation",           occupation),
+                    ("Employer",             employer),
+                    ("Source of Funds",      source_of_funds),
+                    ("Beneficial Ownership", beneficial_ownership),
+                ]
+                if not val.strip()
             ]
-            if not val.strip()
-        ]
-        if missing:
-            st.error(f"Please fill in: {', '.join(missing)}")
-        else:
-            submission = Submission(
-                full_name=full_name.strip(),
-                date_of_birth=str(date_of_birth),
-                nationality=nationality.strip(),
-                country_of_birth=country_of_birth.strip(),
-                country_of_residence=country_of_residence.strip(),
-                occupation=occupation.strip(),
-                employer=employer.strip(),
-                source_of_funds=source_of_funds.strip(),
-                expected_transaction_volume=expected_transaction_volume,
-                pep_status=(pep_raw == "Yes"),
-                beneficial_ownership=beneficial_ownership.strip(),
-            )
-            save_submission(submission)
+            if missing:
+                st.error(f"Please fill in: {', '.join(missing)}")
+            else:
+                submission = Submission(
+                    full_name=full_name.strip(),
+                    date_of_birth=str(date_of_birth),
+                    nationality=nationality.strip(),
+                    country_of_birth=country_of_birth.strip(),
+                    country_of_residence=country_of_residence.strip(),
+                    occupation=occupation.strip(),
+                    employer=employer.strip(),
+                    source_of_funds=source_of_funds.strip(),
+                    expected_transaction_volume=expected_transaction_volume,
+                    pep_status=(pep_raw == "Yes"),
+                    beneficial_ownership=beneficial_ownership.strip(),
+                )
+                save_submission(submission)
 
-            with st.spinner("Analysing your submission..."):
+                with st.spinner("Analysing your submission..."):
+                    try:
+                        run_analysis(submission.id)
+                    except Exception as e:
+                        st.warning(f"Analysis could not complete automatically: {e}")
+
+                st.success(
+                    f"Application submitted. Your reference ID is **{submission.id}**. "
+                    "A compliance analyst will review your application."
+                )
+
+    # ── Check status / dispute ────────────────────────────────────────────────
+
+    elif cv == "check_status":
+        if st.button("← Back"):
+            st.session_state.customer_view = "home"
+            st.session_state.pop("_looked_up_id", None)
+            st.rerun()
+
+        st.title("Check Application Status")
+        st.write("Enter your reference ID to view your application status or file a dispute.")
+
+        lookup_id = st.text_input(
+            "Reference ID",
+            placeholder="e.g. A1B2C3D4",
+            key="lookup_id",
+        ).strip().upper()
+
+        if st.button("Check Status", type="primary", key="do_lookup"):
+            if not lookup_id:
+                st.error("Please enter your reference ID.")
+            else:
                 try:
-                    run_analysis(submission.id)
-                except Exception as e:
-                    st.warning(f"Analysis could not complete automatically: {e}")
+                    load_submission(lookup_id)
+                    st.session_state["_looked_up_id"] = lookup_id
+                except FileNotFoundError:
+                    st.error("No application found with that reference ID.")
+                    st.session_state.pop("_looked_up_id", None)
 
-            st.success(
-                f"Application submitted. Your reference ID is **{submission.id}**. "
-                "A compliance analyst will review your application."
-            )
+        if "_looked_up_id" in st.session_state:
+            try:
+                looked_up = load_submission(st.session_state["_looked_up_id"])
+            except FileNotFoundError:
+                st.session_state.pop("_looked_up_id", None)
+                looked_up = None
+
+            if looked_up:
+                st.divider()
+                st.markdown(f"**Name:** {looked_up.full_name}")
+
+                if looked_up.status == "pending":
+                    st.info("Your application is being processed. Please check back shortly.")
+
+                elif looked_up.status == "analyzed":
+                    st.info("Your application is under review by a compliance analyst.")
+
+                elif looked_up.status == "approved":
+                    st.success("Your application has been approved.")
+                    if looked_up.dispute and looked_up.dispute.get("outcome") == "Overturned":
+                        st.caption("Note: approved following a successful dispute review.")
+
+                elif looked_up.status == "rejected":
+                    if looked_up.dispute:
+                        dispute      = looked_up.dispute
+                        disp_outcome = dispute.get("outcome", "")
+                        if disp_outcome == "Overturned":
+                            st.success("Your dispute was successful. The rejection has been overturned.")
+                        else:
+                            st.error("Your application was rejected. Your dispute was reviewed and the decision was upheld.")
+                            st.markdown(f"**Reviewer's reasoning:** {dispute['reasoning']}")
+                    else:
+                        st.error("Your application has been rejected.")
+                        st.write(
+                            "For legal and regulatory reasons, we are unable to disclose the specific grounds "
+                            "for this decision. If you believe this decision is incorrect, you may submit a "
+                            "dispute below and provide any information you believe is relevant."
+                        )
+                        rebuttal_text = st.text_area(
+                            "Your rebuttal",
+                            placeholder=(
+                                "Explain why you believe the rejection is incorrect. "
+                                "Be specific — provide verifiable details that address the reasons for rejection."
+                            ),
+                            height=150,
+                            key="rebuttal_input",
+                        )
+                        if st.button("Submit Dispute", type="primary", key="submit_dispute"):
+                            if not rebuttal_text.strip():
+                                st.error("Please enter a rebuttal before submitting.")
+                            else:
+                                with st.spinner("Submitting your dispute for review…"):
+                                    try:
+                                        review_dispute(looked_up.id, rebuttal_text)
+                                        st.session_state.pop("_looked_up_id", None)
+                                        st.success(
+                                            "Your dispute has been submitted and reviewed. "
+                                            "Enter your reference ID again to see the outcome."
+                                        )
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Dispute submission failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANALYST DASHBOARD
@@ -396,6 +582,22 @@ elif page == "Analyst Dashboard":
             st.caption(f"Decided: {fmt_ts(decision.get('decided_at', ''))}")
             if decision.get("notes"):
                 st.markdown(f"**Analyst notes:** {decision['notes']}")
+
+            # ── Dispute outcome (read-only on analyst side) ───────────────────
+
+            if submission.dispute:
+                dispute      = submission.dispute
+                disp_outcome = dispute.get("outcome", "")
+                disp_color   = "#28a745" if disp_outcome == "Overturned" else "#dc3545"
+                st.divider()
+                st.subheader("Dispute Review")
+                st.markdown(_badge(disp_outcome, disp_color), unsafe_allow_html=True)
+                st.caption(f"Reviewed: {fmt_ts(dispute.get('reviewed_at', ''))}")
+                st.markdown(f"**Reviewer reasoning:** {dispute['reasoning']}")
+                if dispute.get("revised_risk_level"):
+                    st.markdown(f"**Revised risk level:** {dispute['revised_risk_level']}")
+                with st.expander("View customer rebuttal"):
+                    st.write(dispute.get("rebuttal", ""))
 
         elif submission.status == "pending":
             st.info("Analysis is still pending for this submission.")

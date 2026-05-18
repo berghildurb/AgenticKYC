@@ -186,3 +186,104 @@ def run_analysis(submission_id: str) -> Submission:
     submission.status = "analyzed"
     update_submission(submission)
     return submission
+
+
+_DISPUTE_REVIEW_TOOL = {
+    "name": "submit_dispute_review",
+    "description": "Submit the outcome of a customer dispute review.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "enum": ["Upheld", "Overturned"],
+                "description": (
+                    "Upheld = rejection stands. "
+                    "Overturned = customer's rebuttal is accepted and rejection is reversed."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Clear explanation of why the dispute was upheld or overturned. "
+                    "Reference specific points from the original risk brief and the customer's rebuttal. "
+                    "3–5 sentences."
+                ),
+            },
+            "revised_risk_level": {
+                "type": "string",
+                "enum": ["Low", "Medium", "High", "Critical"],
+                "description": "Revised risk level if the outcome is Overturned. Omit if Upheld.",
+            },
+        },
+        "required": ["outcome", "reasoning"],
+    },
+}
+
+_DISPUTE_SYSTEM_PROMPT = """You are a senior KYC compliance analyst conducting a second-level review of a disputed rejection decision.
+
+You will receive:
+1. The original risk brief that led to the rejection
+2. The customer's rebuttal disputing the rejection
+
+Your task is to objectively assess whether the customer's rebuttal provides sufficient new information or credible explanations to overturn the rejection.
+
+Be rigorous. A rebuttal should only succeed if it genuinely addresses the specific concerns raised — not merely reasserts innocence or provides vague reassurances. At the same time, if the rebuttal provides specific, credible, and verifiable information that materially changes the risk picture, you should be willing to overturn the decision.
+
+Use the submit_dispute_review tool to record your outcome."""
+
+
+def review_dispute(submission_id: str, rebuttal: str) -> Submission:
+    """Run a second-level dispute review and persist the result."""
+    submission = load_submission(submission_id)
+    brief = submission.risk_brief or {}
+
+    signals_text = "\n".join(
+        f"- [{s['severity']}] {s['signal']}: {s['reasoning']}"
+        for s in brief.get("flagged_signals", [])
+    )
+    osint_text = "\n".join(
+        f"- {o['source']} (Relevance: {o['relevance']}): {o['finding']}"
+        for o in brief.get("osint_findings", [])
+    )
+
+    user_message = f"""A customer has disputed their KYC rejection. Please review.
+
+**Original risk brief**
+- Risk level: {brief.get('risk_level', 'N/A')}
+- Risk score: {brief.get('risk_score', 'N/A')} / 100
+- Recommendation: {brief.get('recommendation', 'N/A')}
+- Summary: {brief.get('summary', 'N/A')}
+
+**Flagged signals:**
+{signals_text or 'None recorded.'}
+
+**OSINT findings:**
+{osint_text or 'None recorded.'}
+
+**Customer's rebuttal:**
+{rebuttal.strip()}
+
+Assess whether the rebuttal materially addresses the concerns and submit your dispute review."""
+
+    response = _client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=_DISPUTE_SYSTEM_PROMPT,
+        tools=[_DISPUTE_REVIEW_TOOL],
+        tool_choice={"type": "tool", "name": "submit_dispute_review"},
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    tool_block = next(b for b in response.content if b.type == "tool_use")
+    dispute = dict(tool_block.input)
+    dispute["rebuttal"] = rebuttal.strip()
+    dispute["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+
+    submission.dispute = dispute
+    if dispute["outcome"] == "Overturned":
+        submission.status = "approved"
+        if submission.decision:
+            submission.decision["overturned"] = True
+    update_submission(submission)
+    return submission
