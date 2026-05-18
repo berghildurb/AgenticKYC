@@ -5,7 +5,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from models import Submission
-from prompts import SYSTEM_PROMPT, build_osint_prompt, build_user_message
+from prompts import SYSTEM_PROMPT, EDD_SYSTEM_PROMPT, build_osint_prompt, build_user_message, build_edd_user_message
 from storage import load_submission, update_submission
 
 load_dotenv(override=True)
@@ -179,10 +179,76 @@ def analyse_submission(submission: Submission) -> dict:
     return brief
 
 
+def _run_preliminary_analysis(submission: Submission) -> dict:
+    """
+    PEP submissions only. Run OSINT and identify signals, but leave risk_level
+    and risk_score as None — the EDD form is required before they can be set.
+    """
+    osint_summary = _run_osint(submission)
+
+    response = _client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        tools=[_RISK_BRIEF_TOOL],
+        tool_choice={"type": "tool", "name": "submit_risk_brief"},
+        messages=[{"role": "user", "content": build_user_message(submission, osint_summary=osint_summary)}],
+    )
+
+    tool_block = next(b for b in response.content if b.type == "tool_use")
+    brief = dict(tool_block.input)
+    # Override: EDD must be completed before risk can be finalised
+    brief["risk_level"] = None
+    brief["risk_score"] = None
+    brief["recommendation"] = "Review"
+    brief["edd_pending"] = True
+    brief["analysed_at"] = datetime.now(timezone.utc).isoformat()
+    return brief
+
+
 def run_analysis(submission_id: str) -> Submission:
     """Load, analyse, persist, and return the updated submission."""
     submission = load_submission(submission_id)
-    submission.risk_brief = analyse_submission(submission)
+    if submission.pep_status:
+        submission.risk_brief = _run_preliminary_analysis(submission)
+        submission.status = "awaiting_edd"
+    else:
+        submission.risk_brief = analyse_submission(submission)
+        submission.status = "analyzed"
+    update_submission(submission)
+    return submission
+
+
+def finalise_edd_analysis(submission_id: str) -> Submission:
+    """
+    Full EDD risk analysis. Called after the customer submits the EDD form.
+    Reuses OSINT from the preliminary brief; produces a complete risk brief
+    and sets status to 'analyzed'.
+    """
+    submission = load_submission(submission_id)
+
+    # Reconstruct OSINT text from the preliminary brief (avoids re-running OSINT)
+    preliminary_brief = submission.risk_brief or {}
+    osint_summary = "\n".join(
+        f"- {o['source']} (Relevance: {o['relevance']}): {o['finding']}"
+        for o in preliminary_brief.get("osint_findings", [])
+    ) or "No OSINT findings available from preliminary analysis."
+
+    response = _client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=EDD_SYSTEM_PROMPT,
+        tools=[_RISK_BRIEF_TOOL],
+        tool_choice={"type": "tool", "name": "submit_risk_brief"},
+        messages=[{"role": "user", "content": build_edd_user_message(submission, osint_summary=osint_summary)}],
+    )
+
+    tool_block = next(b for b in response.content if b.type == "tool_use")
+    brief = dict(tool_block.input)
+    brief["analysed_at"] = datetime.now(timezone.utc).isoformat()
+    brief["edd_completed"] = True
+
+    submission.risk_brief = brief
     submission.status = "analyzed"
     update_submission(submission)
     return submission

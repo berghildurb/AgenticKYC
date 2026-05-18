@@ -4,7 +4,7 @@ from pathlib import Path
 import streamlit as st
 from datetime import date, datetime, timezone
 
-from agent import run_analysis, review_dispute
+from agent import run_analysis, review_dispute, finalise_edd_analysis
 from models import Submission
 from storage import load_all_submissions, load_submission, save_submission, update_submission
 from synthetic_profiles import SYNTHETIC_PROFILES
@@ -43,10 +43,11 @@ _RISK_COLORS = {
     "Critical": "#6f42c1",
 }
 _STATUS_COLORS = {
-    "pending":  "#6c757d",
-    "analyzed": "#0d6efd",
-    "approved": "#28a745",
-    "rejected": "#dc3545",
+    "pending":      "#6c757d",
+    "awaiting_edd": "#f59e0b",
+    "analyzed":     "#0d6efd",
+    "approved":     "#28a745",
+    "rejected":     "#dc3545",
 }
 
 
@@ -62,7 +63,9 @@ def risk_badge(level: str) -> str:
 
 
 def status_badge(status: str) -> str:
-    return _badge(status.capitalize(), _STATUS_COLORS.get(status, "#6c757d"))
+    _labels = {"awaiting_edd": "Awaiting EDD"}
+    label = _labels.get(status, status.capitalize())
+    return _badge(label, _STATUS_COLORS.get(status, "#6c757d"))
 
 
 def fmt_ts(iso: str) -> str:
@@ -100,21 +103,20 @@ if page == "Analyst Dashboard" and st.session_state.customer_view != "home":
     st.session_state.pop("_looked_up_id", None)
     st.session_state.pop("_inbox_open_idx", None)
 
-if page == "Customer Onboarding":
-    _inbox_unread = 0
-    if "_looked_up_id" in st.session_state:
-        try:
-            _inbox_unread = sum(
-                1 for e in load_submission(st.session_state["_looked_up_id"]).emails
-                if not e.get("read")
-            )
-        except Exception:
-            pass
-    _inbox_label = f"📬 My Inbox  ({_inbox_unread})" if _inbox_unread > 0 else "📬 My Inbox"
-    if st.sidebar.button(_inbox_label, use_container_width=True, key="nav_inbox"):
-        st.session_state.customer_view = "inbox"
-        st.session_state.pop("_inbox_open_idx", None)
-        st.rerun()
+_inbox_unread = 0
+if "_looked_up_id" in st.session_state:
+    try:
+        _inbox_unread = sum(
+            1 for e in load_submission(st.session_state["_looked_up_id"]).emails
+            if not e.get("read")
+        )
+    except Exception:
+        pass
+_inbox_label = f"📬 My Inbox  ({_inbox_unread})" if _inbox_unread > 0 else "📬 My Inbox"
+if st.sidebar.button(_inbox_label, use_container_width=True, key="nav_inbox"):
+    st.session_state.customer_view = "inbox"
+    st.session_state.pop("_inbox_open_idx", None)
+    st.rerun()
 
 st.sidebar.divider()
 if st.sidebar.button("⚡ Generate Test Submissions", use_container_width=True):
@@ -226,6 +228,14 @@ if page == "Customer Onboarding":
             st.session_state.customer_view = "home"
             st.rerun()
 
+        # Clear form fields before any widgets render (cannot do this mid-run)
+        if st.session_state.pop("_form_clear", False):
+            for _k in ["fv_first_name", "fv_middle_name", "fv_last_name",
+                       "fv_nationality", "fv_country_of_birth",
+                       "fv_country_of_residence", "fv_occupation", "fv_employer",
+                       "fv_source_of_funds", "fv_beneficial_ownership"]:
+                st.session_state[_k] = ""
+
         st.title("New Application")
         st.write(
             "Please complete all fields accurately. "
@@ -234,7 +244,8 @@ if page == "Customer Onboarding":
 
         # Initialise persistent field values so they survive a failed validation rerun
         for _k, _default in [
-            ("fv_full_name", ""), ("fv_nationality", ""), ("fv_country_of_birth", ""),
+            ("fv_first_name", ""), ("fv_middle_name", ""), ("fv_last_name", ""),
+            ("fv_nationality", ""), ("fv_country_of_birth", ""),
             ("fv_country_of_residence", ""), ("fv_occupation", ""), ("fv_employer", ""),
             ("fv_source_of_funds", ""), ("fv_beneficial_ownership", ""),
         ]:
@@ -244,9 +255,21 @@ if page == "Customer Onboarding":
         # Show submission success message (set after a successful submit + rerun)
         _sid = st.session_state.pop("_form_success_id", None)
         if _sid:
+            st.session_state["_last_success_id"] = _sid
+        _last_sid = st.session_state.get("_last_success_id")
+        if _last_sid:
             st.success(
-                f"Application submitted. Your reference ID is **{_sid}**. "
+                f"Application submitted. Your reference ID is **{_last_sid}**. "
                 "A compliance analyst will review your application."
+            )
+
+        # Show analysis error if analysis failed on previous run
+        _analysis_err = st.session_state.pop("_analysis_error", None)
+        if _analysis_err:
+            st.error(
+                f"Your application was submitted but the automated analysis could not complete. "
+                f"A compliance analyst has been notified and will review it manually.\n\n"
+                f"*Technical detail: {_analysis_err}*"
             )
 
         # Validation error banner rendered above the form
@@ -269,8 +292,14 @@ if page == "Customer Onboarding":
         with st.form("kyc_form"):
             st.subheader("Personal Information")
 
-            _label("Full Legal Name")
-            full_name = st.text_input("Full Legal Name", key="fv_full_name", label_visibility="collapsed")
+            _label("First Name")
+            first_name = st.text_input("First Name", key="fv_first_name", label_visibility="collapsed")
+
+            _label("Middle Name", required=False)
+            middle_name = st.text_input("Middle Name", key="fv_middle_name", label_visibility="collapsed")
+
+            _label("Last Name")
+            last_name = st.text_input("Last Name", key="fv_last_name", label_visibility="collapsed")
 
             _label("Date of Birth")
             date_of_birth = st.date_input(
@@ -345,7 +374,8 @@ if page == "Customer Onboarding":
         if submitted:
             missing = [
                 label for label, val in [
-                    ("Full Legal Name",      full_name),
+                    ("First Name",           first_name),
+                    ("Last Name",            last_name),
                     ("Nationality",          nationality),
                     ("Country of Birth",     country_of_birth),
                     ("Country of Residence", country_of_residence),
@@ -361,8 +391,11 @@ if page == "Customer Onboarding":
                     f"Please complete the following required fields: **{fields_list}**."
                 )
             else:
+                _parts = [first_name.strip(), middle_name.strip(), last_name.strip()]
+                _full_name = " ".join(p for p in _parts if p)
+                _pep = (pep_raw == "Yes")
                 submission = Submission(
-                    full_name=full_name.strip(),
+                    full_name=_full_name,
                     date_of_birth=str(date_of_birth),
                     nationality=nationality.strip(),
                     country_of_birth=country_of_birth.strip(),
@@ -371,18 +404,23 @@ if page == "Customer Onboarding":
                     employer=employer.strip(),
                     source_of_funds=source_of_funds.strip(),
                     expected_transaction_volume=expected_transaction_volume,
-                    pep_status=(pep_raw == "Yes"),
+                    pep_status=_pep,
                     beneficial_ownership=beneficial_ownership.strip(),
+                    edd_required=_pep,
                 )
                 save_submission(submission)
 
+                _analysis_error = None
                 with st.spinner("Analysing your submission..."):
                     try:
                         run_analysis(submission.id)
                     except Exception as e:
-                        st.warning(f"Analysis could not complete automatically: {e}")
+                        _analysis_error = str(e)
 
-                # Add welcome email (reload so we don't overwrite the risk brief)
+                if _analysis_error:
+                    st.session_state["_analysis_error"] = _analysis_error
+
+                # Add emails (reload so we don't overwrite the risk brief)
                 _post = load_submission(submission.id)
                 _append_email(
                     _post,
@@ -392,16 +430,30 @@ if page == "Customer Onboarding":
                     "been made. Please keep your reference ID safe — you will need it to check "
                     "the status of your application.",
                 )
+                if _post.edd_required:
+                    _append_email(
+                        _post,
+                        "Action Required — Enhanced Due Diligence",
+                        f"Because you have declared a political affiliation, we are required to "
+                        f"collect additional information before your application (Reference ID: {_post.id}) "
+                        "can proceed. Please complete the Enhanced Due Diligence form by selecting "
+                        "'Check My Application' and entering your reference ID.",
+                        action="edd",
+                    )
                 update_submission(_post)
                 st.session_state["_looked_up_id"] = _post.id  # pre-fill so inbox works immediately
 
-                # Clear form fields, store success ID, rerun to show clean state
-                for _k in ["fv_full_name", "fv_nationality", "fv_country_of_birth",
-                           "fv_country_of_residence", "fv_occupation", "fv_employer",
-                           "fv_source_of_funds", "fv_beneficial_ownership"]:
-                    st.session_state[_k] = ""
+                # Flag for clearing on next run — cannot modify widget keys mid-run
+                st.session_state["_form_clear"] = True
                 st.session_state["_form_success_id"] = submission.id
+                st.session_state.pop("_last_success_id", None)  # clear so top banner rerenders
                 st.rerun()
+
+        if _last_sid:
+            st.success(
+                f"Application submitted. Your reference ID is **{_last_sid}**. "
+                "A compliance analyst will review your application."
+            )
 
     # ── Inbox ─────────────────────────────────────────────────────────────────
 
@@ -458,6 +510,12 @@ if page == "Customer Onboarding":
                     if _email.get("action") == "dispute":
                         st.markdown("<br>", unsafe_allow_html=True)
                         if st.button("Go to Dispute →", type="primary", key="inbox_go_dispute"):
+                            st.session_state.customer_view = "check_status"
+                            st.session_state.pop("_inbox_open_idx", None)
+                            st.rerun()
+                    elif _email.get("action") == "edd":
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("Complete EDD Form →", type="primary", key="inbox_go_edd"):
                             st.session_state.customer_view = "check_status"
                             st.session_state.pop("_inbox_open_idx", None)
                             st.rerun()
@@ -552,6 +610,154 @@ if page == "Customer Onboarding":
 
                 if looked_up.status == "pending":
                     st.info("Your application is being processed. Please check back shortly.")
+
+                elif looked_up.status == "awaiting_edd":
+                    st.markdown(
+                        '<div style="background:#fef3c7;border-left:4px solid #f59e0b;'
+                        'padding:14px 18px;border-radius:0 8px 8px 0;margin-bottom:1.5rem">'
+                        '<strong>Action Required</strong><br>'
+                        'Your application requires additional information before it can proceed. '
+                        'Please complete the Enhanced Due Diligence form below.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    _edd_error = st.empty()
+
+                    with st.form("edd_form"):
+                        st.subheader("Enhanced Due Diligence")
+                        st.write(
+                            "Because you have declared a political affiliation, we are required "
+                            "to collect the following information. All fields are required unless "
+                            "marked optional."
+                        )
+
+                        st.markdown("**Nature of PEP connection**")
+                        edd_connection = st.radio(
+                            "Nature of PEP connection",
+                            ["I am personally a PEP",
+                             "I am a family member of a PEP",
+                             "I am a close associate of a PEP"],
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown(
+                            'Full name of the politically exposed person '
+                            '<span style="color:#94a3b8;font-size:0.85em">(if not yourself)</span>',
+                            unsafe_allow_html=True,
+                        )
+                        edd_pep_name = st.text_input(
+                            "PEP full name",
+                            placeholder="Leave blank if you are the PEP",
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown('Their official role or position <span style="color:#ef4444;font-weight:600">*</span>', unsafe_allow_html=True)
+                        edd_pep_role = st.text_input(
+                            "PEP role",
+                            placeholder="e.g. Minister of Finance, Senator, Deputy Director",
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown('Country and institution they are or were associated with <span style="color:#ef4444;font-weight:600">*</span>', unsafe_allow_html=True)
+                        edd_pep_country_inst = st.text_input(
+                            "Country and institution",
+                            placeholder="e.g. Ministry of Finance, Government of South Sudan",
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown("**How long has this connection been active?**")
+                        edd_duration = st.selectbox(
+                            "Connection duration",
+                            ["Less than 1 year", "1–5 years", "More than 5 years", "No longer active"],
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown('Source of wealth — origin of your total accumulated wealth and assets <span style="color:#ef4444;font-weight:600">*</span>', unsafe_allow_html=True)
+                        edd_wealth = st.text_area(
+                            "Source of wealth",
+                            placeholder=(
+                                "Describe the origin of your total wealth and assets — "
+                                "e.g. career earnings, inheritance, business ownership, property sales."
+                            ),
+                            height=120,
+                            label_visibility="collapsed",
+                        )
+
+                        st.markdown("**Are you aware of any investigations or proceedings involving the PEP?**")
+                        edd_investigations = st.radio(
+                            "Investigations",
+                            ["No", "Yes"],
+                            label_visibility="collapsed",
+                        )
+                        st.markdown(
+                            'If Yes — provide details '
+                            '<span style="color:#94a3b8;font-size:0.85em">(optional if No)</span>',
+                            unsafe_allow_html=True,
+                        )
+                        edd_inv_details = st.text_area(
+                            "Investigation details",
+                            placeholder="Describe any known investigations or proceedings",
+                            height=80,
+                            label_visibility="collapsed",
+                        )
+
+                        edd_submitted = st.form_submit_button(
+                            "Submit Enhanced Due Diligence Information",
+                            type="primary",
+                        )
+
+                    if edd_submitted:
+                        edd_missing = []
+                        if not edd_pep_role.strip():
+                            edd_missing.append("PEP official role or position")
+                        if not edd_pep_country_inst.strip():
+                            edd_missing.append("Country and institution")
+                        if not edd_wealth.strip():
+                            edd_missing.append("Source of wealth")
+                        if edd_connection != "I am personally a PEP" and not edd_pep_name.strip():
+                            edd_missing.append("Full name of the politically exposed person")
+                        if edd_investigations == "Yes" and not edd_inv_details.strip():
+                            edd_missing.append("Investigation details (required when Yes is selected)")
+
+                        if edd_missing:
+                            _edd_error.error(
+                                f"Please complete the following required fields: **{', '.join(edd_missing)}**."
+                            )
+                        else:
+                            from datetime import timezone as _tz
+                            _edd_data = {
+                                "pep_connection_type":    edd_connection,
+                                "pep_person_name":        edd_pep_name.strip(),
+                                "pep_role":               edd_pep_role.strip(),
+                                "pep_country_institution": edd_pep_country_inst.strip(),
+                                "connection_duration":    edd_duration,
+                                "source_of_wealth":       edd_wealth.strip(),
+                                "investigations_aware":   edd_investigations,
+                                "investigations_details": edd_inv_details.strip(),
+                                "submitted_at":           datetime.now(timezone.utc).isoformat(),
+                            }
+                            # Save EDD answers before running analysis
+                            _edd_sub = load_submission(looked_up.id)
+                            _edd_sub.edd_form = _edd_data
+                            update_submission(_edd_sub)
+
+                            with st.spinner("Submitting your information and running full analysis…"):
+                                try:
+                                    finalise_edd_analysis(looked_up.id)
+                                    _edd_fresh = load_submission(looked_up.id)
+                                    _append_email(
+                                        _edd_fresh,
+                                        "Enhanced Due Diligence Received",
+                                        f"Thank you for completing your Enhanced Due Diligence "
+                                        f"(Reference ID: {_edd_fresh.id}). Your application is now "
+                                        "under full review by a compliance analyst. We will be in touch "
+                                        "once a decision has been made.",
+                                    )
+                                    update_submission(_edd_fresh)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Submission failed: {e}")
 
                 elif looked_up.status == "analyzed":
                     st.info("Your application is under review by a compliance analyst.")
@@ -683,31 +889,35 @@ elif page == "Analyst Dashboard":
             col_level, col_rec = st.columns(2)
             with col_level:
                 st.markdown("**Overall Risk Level**")
-                st.markdown(risk_badge(brief["risk_level"]), unsafe_allow_html=True)
-                if "risk_score" in brief:
-                    score     = brief["risk_score"]
-                    bar_color = _RISK_COLORS.get(brief["risk_level"], "#6c757d")
-                    st.markdown(
-                        f"""
-                        <div style="margin-top:0.75rem">
-                            <div style="display:flex;align-items:center;gap:0.75rem">
-                                <div style="flex:1;background:#e9ecef;border-radius:6px;height:14px;overflow:hidden">
-                                    <div style="width:{score}%;background:{bar_color};height:100%;border-radius:6px"></div>
+                if brief.get("edd_pending") or brief.get("risk_level") is None:
+                    st.markdown(_badge("EDD Pending", "#f59e0b"), unsafe_allow_html=True)
+                    st.caption("Risk level will be set once the customer completes the EDD form.")
+                else:
+                    st.markdown(risk_badge(brief["risk_level"]), unsafe_allow_html=True)
+                    score = brief.get("risk_score")
+                    if score is not None:
+                        bar_color = _RISK_COLORS.get(brief["risk_level"], "#6c757d")
+                        st.markdown(
+                            f"""
+                            <div style="margin-top:0.75rem">
+                                <div style="display:flex;align-items:center;gap:0.75rem">
+                                    <div style="flex:1;background:#e9ecef;border-radius:6px;height:14px;overflow:hidden">
+                                        <div style="width:{score}%;background:{bar_color};height:100%;border-radius:6px"></div>
+                                    </div>
+                                    <span style="font-weight:700;font-size:1.05em;color:{bar_color};white-space:nowrap">{score} / 100</span>
                                 </div>
-                                <span style="font-weight:700;font-size:1.05em;color:{bar_color};white-space:nowrap">{score} / 100</span>
                             </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                            """,
+                            unsafe_allow_html=True,
+                        )
             with col_rec:
                 st.markdown("**Recommendation**")
                 rec_color = {
                     "Approve": "#28a745",
                     "Review":  "#fd7e14",
                     "Reject":  "#dc3545",
-                }.get(brief["recommendation"], "#6c757d")
-                st.markdown(_badge(brief["recommendation"], rec_color), unsafe_allow_html=True)
+                }.get(brief.get("recommendation", ""), "#6c757d")
+                st.markdown(_badge(brief.get("recommendation", "Pending EDD"), rec_color), unsafe_allow_html=True)
 
             st.markdown(f"*Analysed: {fmt_ts(brief.get('analysed_at', ''))}*")
 
@@ -858,8 +1068,27 @@ elif page == "Analyst Dashboard":
             if decision.get("notes"):
                 st.markdown(f"**Analyst notes:** {decision['notes']}")
 
+        elif submission.status == "awaiting_edd":
+            st.markdown(
+                '<div style="background:#fef3c7;border-left:4px solid #f59e0b;'
+                'padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:1rem">'
+                '<strong>Enhanced Due Diligence in progress</strong><br>'
+                'This customer has declared PEP status. The EDD form has been sent to them and '
+                'must be completed before a decision can be made. No action is required from you at this stage.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
         elif submission.status == "pending":
-            st.info("Analysis is still pending for this submission.")
+            st.info("Analysis has not completed for this submission.")
+            if st.button("Run Analysis Now", type="primary", key="retry_analysis"):
+                with st.spinner("Running analysis…"):
+                    try:
+                        run_analysis(submission.id)
+                        st.success("Analysis complete.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
 
         # ── Disputes section (shown for any status once disputes exist) ────────
 
