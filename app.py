@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import streamlit as st
 from datetime import date, datetime, timezone
@@ -71,12 +72,23 @@ def fmt_ts(iso: str) -> str:
         return iso
 
 
+def _append_email(submission, subject: str, body: str, action: str = "") -> None:
+    """Append a simulated email notification to the submission. Caller must save."""
+    submission.emails.append({
+        "subject": subject,
+        "body":    body,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "read":    False,
+        "action":  action,
+    })
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 if "selected_id" not in st.session_state:
     st.session_state.selected_id = None
 if "customer_view" not in st.session_state:
-    st.session_state.customer_view = "home"  # home | new_application | check_status
+    st.session_state.customer_view = "home"  # home | new_application | check_status | inbox
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
@@ -86,6 +98,23 @@ page = st.sidebar.radio("Navigation", ["Customer Onboarding", "Analyst Dashboard
 if page == "Analyst Dashboard" and st.session_state.customer_view != "home":
     st.session_state.customer_view = "home"
     st.session_state.pop("_looked_up_id", None)
+    st.session_state.pop("_inbox_open_idx", None)
+
+if page == "Customer Onboarding":
+    _inbox_unread = 0
+    if "_looked_up_id" in st.session_state:
+        try:
+            _inbox_unread = sum(
+                1 for e in load_submission(st.session_state["_looked_up_id"]).emails
+                if not e.get("read")
+            )
+        except Exception:
+            pass
+    _inbox_label = f"📬 My Inbox  ({_inbox_unread})" if _inbox_unread > 0 else "📬 My Inbox"
+    if st.sidebar.button(_inbox_label, use_container_width=True, key="nav_inbox"):
+        st.session_state.customer_view = "inbox"
+        st.session_state.pop("_inbox_open_idx", None)
+        st.rerun()
 
 st.sidebar.divider()
 if st.sidebar.button("⚡ Generate Test Submissions", use_container_width=True):
@@ -203,45 +232,103 @@ if page == "Customer Onboarding":
             "Incomplete or false information may result in your application being declined."
         )
 
-        with st.form("kyc_form", clear_on_submit=True):
+        # Initialise persistent field values so they survive a failed validation rerun
+        for _k, _default in [
+            ("fv_full_name", ""), ("fv_nationality", ""), ("fv_country_of_birth", ""),
+            ("fv_country_of_residence", ""), ("fv_occupation", ""), ("fv_employer", ""),
+            ("fv_source_of_funds", ""), ("fv_beneficial_ownership", ""),
+        ]:
+            if _k not in st.session_state:
+                st.session_state[_k] = _default
+
+        # Show submission success message (set after a successful submit + rerun)
+        _sid = st.session_state.pop("_form_success_id", None)
+        if _sid:
+            st.success(
+                f"Application submitted. Your reference ID is **{_sid}**. "
+                "A compliance analyst will review your application."
+            )
+
+        # Validation error banner rendered above the form
+        _error_slot = st.empty()
+
+        def _label(text: str, required: bool = True) -> None:
+            if required:
+                st.markdown(
+                    f'{text} <span style="color:#ef4444;font-weight:600">*</span>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'{text} <span style="color:#94a3b8;font-size:0.85em">(optional)</span>',
+                    unsafe_allow_html=True,
+                )
+
+        st.caption("Fields marked * are required.")
+
+        with st.form("kyc_form"):
             st.subheader("Personal Information")
-            full_name            = st.text_input("Full Legal Name")
-            date_of_birth        = st.date_input(
+
+            _label("Full Legal Name")
+            full_name = st.text_input("Full Legal Name", key="fv_full_name", label_visibility="collapsed")
+
+            _label("Date of Birth")
+            date_of_birth = st.date_input(
                 "Date of Birth",
                 value=date(1990, 1, 1),
                 min_value=date(1900, 1, 1),
                 max_value=date.today(),
+                label_visibility="collapsed",
             )
-            nationality          = st.text_input("Nationality")
-            country_of_birth     = st.text_input("Country of Birth")
-            country_of_residence = st.text_input("Country of Residence")
+
+            _label("Nationality")
+            nationality = st.text_input("Nationality", key="fv_nationality", label_visibility="collapsed")
+
+            _label("Country of Birth")
+            country_of_birth = st.text_input("Country of Birth", key="fv_country_of_birth", label_visibility="collapsed")
+
+            _label("Country of Residence")
+            country_of_residence = st.text_input("Country of Residence", key="fv_country_of_residence", label_visibility="collapsed")
 
             st.subheader("Employment & Finances")
-            occupation                  = st.text_input("Occupation / Job Title")
-            employer                    = st.text_input("Employer or Business Name")
-            source_of_funds             = st.text_area(
+
+            _label("Occupation / Job Title")
+            occupation = st.text_input("Occupation / Job Title", key="fv_occupation", label_visibility="collapsed")
+
+            _label("Employer or Business Name")
+            employer = st.text_input("Employer or Business Name", key="fv_employer", label_visibility="collapsed")
+
+            _label("Source of Funds")
+            source_of_funds = st.text_area(
                 "Source of Funds",
                 placeholder=(
                     "Describe how you obtained the funds you intend to use — "
                     "e.g. salary, business income, inheritance, sale of property."
                 ),
                 height=100,
+                key="fv_source_of_funds",
+                label_visibility="collapsed",
             )
+
+            _label("Expected Monthly Transaction Volume")
             expected_transaction_volume = st.selectbox(
                 "Expected Monthly Transaction Volume",
                 ["Under €1,000", "€1,000 – €10,000", "€10,000 – €50,000",
                  "€50,000 – €100,000", "Over €100,000"],
+                label_visibility="collapsed",
             )
 
             st.subheader("Compliance Declarations")
+
+            _label("Are you, or have you ever been, a Politically Exposed Person (PEP)?")
+            st.caption("A PEP is someone who holds or has held a prominent public position, or is a close associate of such a person.")
             pep_raw = st.radio(
-                "Are you, or have you ever been, a Politically Exposed Person (PEP)?",
+                "PEP status",
                 ["No", "Yes"],
-                help=(
-                    "A PEP is someone who holds or has held a prominent public position, "
-                    "or is a close associate of such a person."
-                ),
+                label_visibility="collapsed",
             )
+
+            _label("Beneficial Ownership", required=False)
             beneficial_ownership = st.text_area(
                 "Beneficial Ownership",
                 placeholder=(
@@ -249,6 +336,8 @@ if page == "Customer Onboarding":
                     "If yes, provide their full name, relationship, and reason."
                 ),
                 height=100,
+                key="fv_beneficial_ownership",
+                label_visibility="collapsed",
             )
 
             submitted = st.form_submit_button("Submit Application", type="primary")
@@ -263,12 +352,14 @@ if page == "Customer Onboarding":
                     ("Occupation",           occupation),
                     ("Employer",             employer),
                     ("Source of Funds",      source_of_funds),
-                    ("Beneficial Ownership", beneficial_ownership),
                 ]
                 if not val.strip()
             ]
             if missing:
-                st.error(f"Please fill in: {', '.join(missing)}")
+                fields_list = ", ".join(missing)
+                _error_slot.error(
+                    f"Please complete the following required fields: **{fields_list}**."
+                )
             else:
                 submission = Submission(
                     full_name=full_name.strip(),
@@ -291,10 +382,134 @@ if page == "Customer Onboarding":
                     except Exception as e:
                         st.warning(f"Analysis could not complete automatically: {e}")
 
-                st.success(
-                    f"Application submitted. Your reference ID is **{submission.id}**. "
-                    "A compliance analyst will review your application."
+                # Add welcome email (reload so we don't overwrite the risk brief)
+                _post = load_submission(submission.id)
+                _append_email(
+                    _post,
+                    f"Application Received — Reference ID: {_post.id}",
+                    f"We have received your KYC application (Reference ID: {_post.id}) and it is "
+                    "now under review. A compliance analyst will be in touch once a decision has "
+                    "been made. Please keep your reference ID safe — you will need it to check "
+                    "the status of your application.",
                 )
+                update_submission(_post)
+                st.session_state["_looked_up_id"] = _post.id  # pre-fill so inbox works immediately
+
+                # Clear form fields, store success ID, rerun to show clean state
+                for _k in ["fv_full_name", "fv_nationality", "fv_country_of_birth",
+                           "fv_country_of_residence", "fv_occupation", "fv_employer",
+                           "fv_source_of_funds", "fv_beneficial_ownership"]:
+                    st.session_state[_k] = ""
+                st.session_state["_form_success_id"] = submission.id
+                st.rerun()
+
+    # ── Inbox ─────────────────────────────────────────────────────────────────
+
+    elif cv == "inbox":
+        if st.button("← Back"):
+            st.session_state.customer_view = "home"
+            st.session_state.pop("_inbox_open_idx", None)
+            st.rerun()
+
+        st.title("My Inbox")
+
+        if "_looked_up_id" not in st.session_state:
+            st.write("Enter your reference ID to view your messages.")
+            _inbox_id_input = st.text_input(
+                "Reference ID", placeholder="e.g. A1B2C3D4", key="inbox_id_input"
+            ).strip().upper()
+            if st.button("View Messages", type="primary", key="inbox_lookup_btn"):
+                if not _inbox_id_input:
+                    st.error("Please enter your reference ID.")
+                else:
+                    try:
+                        load_submission(_inbox_id_input)
+                        st.session_state["_looked_up_id"] = _inbox_id_input
+                        st.rerun()
+                    except FileNotFoundError:
+                        st.error("No application found with that reference ID.")
+        else:
+            try:
+                _inbox_sub = load_submission(st.session_state["_looked_up_id"])
+            except FileNotFoundError:
+                st.session_state.pop("_looked_up_id", None)
+                st.error("Application not found. Please re-enter your reference ID.")
+                st.rerun()
+                _inbox_sub = None
+
+            if _inbox_sub:
+                _emails_rev = list(reversed(_inbox_sub.emails))
+                _n = len(_emails_rev)
+                _open_idx = st.session_state.get("_inbox_open_idx")
+
+                if _open_idx is not None and _open_idx < _n:
+                    # ── Open email view ───────────────────────────────────────
+                    _email = _emails_rev[_open_idx]
+
+                    if st.button("← Back to inbox"):
+                        st.session_state.pop("_inbox_open_idx", None)
+                        st.rerun()
+
+                    st.markdown(f"### {_email['subject']}")
+                    st.caption(fmt_ts(_email["timestamp"]))
+                    st.divider()
+                    st.write(_email["body"])
+
+                    if _email.get("action") == "dispute":
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("Go to Dispute →", type="primary", key="inbox_go_dispute"):
+                            st.session_state.customer_view = "check_status"
+                            st.session_state.pop("_inbox_open_idx", None)
+                            st.rerun()
+
+                else:
+                    # ── Email list view ───────────────────────────────────────
+                    _unread_total = sum(1 for e in _inbox_sub.emails if not e.get("read"))
+                    st.caption(
+                        f"Application {_inbox_sub.id}  ·  {_n} message(s)"
+                        + (f"  ·  {_unread_total} unread" if _unread_total else "")
+                    )
+
+                    if _n == 0:
+                        st.info("No messages yet.")
+                    else:
+                        for _i, _email in enumerate(_emails_rev):
+                            _is_unread = not _email.get("read", False)
+                            _col_dot, _col_content, _col_btn = st.columns([0.4, 6.2, 1.2])
+
+                            with _col_dot:
+                                if _is_unread:
+                                    st.markdown(
+                                        '<div style="width:8px;height:8px;background:#2563eb;'
+                                        'border-radius:50%;margin-top:14px"></div>',
+                                        unsafe_allow_html=True,
+                                    )
+
+                            with _col_content:
+                                _w = "700" if _is_unread else "400"
+                                _c = "#0f172a" if _is_unread else "#64748b"
+                                st.markdown(
+                                    f'<div style="font-weight:{_w};color:{_c};font-size:0.95em;'
+                                    f'padding-top:4px">{_email["subject"]}</div>'
+                                    f'<div style="font-size:0.8em;color:#94a3b8;margin-top:2px">'
+                                    f'{fmt_ts(_email["timestamp"])}</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                            with _col_btn:
+                                if st.button("Open", key=f"open_email_{_i}", use_container_width=True):
+                                    # Mark as read on open
+                                    _orig = _n - 1 - _i
+                                    if not _inbox_sub.emails[_orig].get("read"):
+                                        _inbox_sub.emails[_orig]["read"] = True
+                                        update_submission(_inbox_sub)
+                                    st.session_state["_inbox_open_idx"] = _i
+                                    st.rerun()
+
+                            st.markdown(
+                                '<div style="border-top:1px solid #f1f5f9;margin:4px 0 2px"></div>',
+                                unsafe_allow_html=True,
+                            )
 
     # ── Check status / dispute ────────────────────────────────────────────────
 
@@ -343,46 +558,90 @@ if page == "Customer Onboarding":
 
                 elif looked_up.status == "approved":
                     st.success("Your application has been approved.")
-                    if looked_up.dispute and looked_up.dispute.get("outcome") == "Overturned":
+                    if any(d.get("analyst_decision") == "Accepted" for d in (looked_up.disputes or [])):
                         st.caption("Note: approved following a successful dispute review.")
 
                 elif looked_up.status == "rejected":
-                    if looked_up.dispute:
-                        dispute      = looked_up.dispute
-                        disp_outcome = dispute.get("outcome", "")
-                        if disp_outcome == "Overturned":
-                            st.success("Your dispute was successful. The rejection has been overturned.")
-                        else:
-                            st.error("Your application was rejected. Your dispute was reviewed and the decision was upheld.")
-                            st.markdown(f"**Reviewer's reasoning:** {dispute['reasoning']}")
+                    cust_disputes   = looked_up.disputes or []
+                    dispute_count   = looked_up.dispute_count
+                    has_pending     = any(not d.get("analyst_decision") for d in cust_disputes)
+
+                    if has_pending:
+                        st.warning(
+                            "Your dispute has been received and is under review. "
+                            "We will contact you once a decision has been made."
+                        )
+                    elif dispute_count >= 2:
+                        st.error("Your application has been rejected.")
+                        st.warning(
+                            "You have reached the maximum number of disputes. "
+                            "Please contact us at compliance@kycplatform.com"
+                        )
                     else:
+                        # Customer can file a dispute (0 filed, or 1 filed and upheld)
                         st.error("Your application has been rejected.")
                         st.write(
-                            "For legal and regulatory reasons, we are unable to disclose the specific grounds "
-                            "for this decision. If you believe this decision is incorrect, you may submit a "
-                            "dispute below and provide any information you believe is relevant."
+                            "For legal and regulatory reasons, we are unable to disclose the specific "
+                            "grounds for this decision. If you believe this decision is incorrect, you "
+                            "may submit a dispute below and provide any information you believe is relevant."
                         )
+
+                        dispute_num = dispute_count + 1
+                        st.caption(f"Dispute {dispute_num} of 2")
+
                         rebuttal_text = st.text_area(
-                            "Your rebuttal",
+                            "Explain why you believe this decision is incorrect",
                             placeholder=(
-                                "Explain why you believe the rejection is incorrect. "
-                                "Be specific — provide verifiable details that address the reasons for rejection."
+                                "Be specific — provide verifiable details that address "
+                                "the reasons for your rejection."
                             ),
                             height=150,
                             key="rebuttal_input",
                         )
+                        tin_input = st.text_input(
+                            "Tax Identification Number (optional)",
+                            placeholder="Provide this to help verify your income source",
+                            key="tin_input",
+                        )
+                        uploaded_files = st.file_uploader(
+                            "Supporting documents — payslip, bank statement, ID (optional)",
+                            type=["pdf", "png", "jpg", "jpeg"],
+                            accept_multiple_files=True,
+                            key="dispute_docs",
+                        )
+
                         if st.button("Submit Dispute", type="primary", key="submit_dispute"):
                             if not rebuttal_text.strip():
-                                st.error("Please enter a rebuttal before submitting.")
+                                st.error("Please explain why you believe the rejection is incorrect.")
                             else:
-                                with st.spinner("Submitting your dispute for review…"):
+                                files_to_save = (uploaded_files or [])[:2]
+                                filenames = []
+                                if files_to_save:
+                                    dispute_dir = Path(f"data/disputes/{looked_up.id}")
+                                    dispute_dir.mkdir(parents=True, exist_ok=True)
+                                    for uf in files_to_save:
+                                        fname = f"d{dispute_num}_{uf.name}"
+                                        with open(dispute_dir / fname, "wb") as out:
+                                            out.write(uf.getbuffer())
+                                        filenames.append(fname)
+
+                                with st.spinner("Submitting your dispute…"):
                                     try:
-                                        review_dispute(looked_up.id, rebuttal_text)
-                                        st.session_state.pop("_looked_up_id", None)
-                                        st.success(
-                                            "Your dispute has been submitted and reviewed. "
-                                            "Enter your reference ID again to see the outcome."
+                                        review_dispute(
+                                            looked_up.id,
+                                            rebuttal_text,
+                                            tin=tin_input,
+                                            document_filenames=filenames,
                                         )
+                                        _fresh = load_submission(looked_up.id)
+                                        _append_email(
+                                            _fresh,
+                                            "Dispute Received",
+                                            f"We have received your dispute "
+                                            f"(Reference ID: {_fresh.id}) and it is under review. "
+                                            "We will contact you once a decision has been made.",
+                                        )
+                                        update_submission(_fresh)
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"Dispute submission failed: {e}")
@@ -560,6 +819,12 @@ elif page == "Analyst Dashboard":
                         "notes":      notes.strip(),
                         "decided_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    _append_email(
+                        submission,
+                        "Application Approved",
+                        f"We are pleased to inform you that your application "
+                        f"(Reference ID: {submission.id}) has been approved. Welcome aboard.",
+                    )
                     update_submission(submission)
                     st.rerun()
 
@@ -571,6 +836,16 @@ elif page == "Analyst Dashboard":
                         "notes":      notes.strip(),
                         "decided_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    _append_email(
+                        submission,
+                        "Application Update",
+                        f"We regret to inform you that we were unable to approve your application "
+                        f"(Reference ID: {submission.id}) at this time. For legal and regulatory "
+                        "reasons we are unable to share the specific grounds for this decision. "
+                        "If you believe this decision is incorrect, you may submit a dispute using "
+                        "your reference ID.",
+                        action="dispute",
+                    )
                     update_submission(submission)
                     st.rerun()
 
@@ -583,24 +858,126 @@ elif page == "Analyst Dashboard":
             if decision.get("notes"):
                 st.markdown(f"**Analyst notes:** {decision['notes']}")
 
-            # ── Dispute outcome (read-only on analyst side) ───────────────────
-
-            if submission.dispute:
-                dispute      = submission.dispute
-                disp_outcome = dispute.get("outcome", "")
-                disp_color   = "#28a745" if disp_outcome == "Overturned" else "#dc3545"
-                st.divider()
-                st.subheader("Dispute Review")
-                st.markdown(_badge(disp_outcome, disp_color), unsafe_allow_html=True)
-                st.caption(f"Reviewed: {fmt_ts(dispute.get('reviewed_at', ''))}")
-                st.markdown(f"**Reviewer reasoning:** {dispute['reasoning']}")
-                if dispute.get("revised_risk_level"):
-                    st.markdown(f"**Revised risk level:** {dispute['revised_risk_level']}")
-                with st.expander("View customer rebuttal"):
-                    st.write(dispute.get("rebuttal", ""))
-
         elif submission.status == "pending":
             st.info("Analysis is still pending for this submission.")
+
+        # ── Disputes section (shown for any status once disputes exist) ────────
+
+        if submission.disputes:
+            has_pending_dispute = any(not d.get("analyst_decision") for d in submission.disputes)
+
+            st.divider()
+
+            if has_pending_dispute:
+                st.markdown(
+                    '<div style="background:#fef3c7;border-left:4px solid #f59e0b;'
+                    'padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:1.5rem">'
+                    '<strong>This customer has filed a dispute — your review is required</strong>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            for i, disp in enumerate(submission.disputes, 1):
+                st.subheader(f"Dispute {i} of {submission.dispute_count}")
+                st.caption(f"Filed: {fmt_ts(disp.get('timestamp', ''))}")
+
+                st.markdown("**Customer rebuttal**")
+                st.write(disp.get("rebuttal", ""))
+
+                if disp.get("tin"):
+                    st.markdown(f"**Tax Identification Number:** `{disp['tin']}`")
+
+                docs = disp.get("documents_uploaded", [])
+                if docs:
+                    st.markdown(f"**Supporting documents:** {', '.join(docs)}")
+
+                # AI recommendation card
+                ai_rec   = disp.get("ai_recommendation", "")
+                ai_color = "#16a34a" if ai_rec == "Overturn Rejection" else "#dc2626"
+                rl_line  = (
+                    f'<div style="margin-top:6px;font-size:0.85em;color:#64748b">'
+                    f'Suggested revised risk level: <strong>{disp["revised_risk_level"]}</strong></div>'
+                    if disp.get("revised_risk_level") else ""
+                )
+                st.markdown(
+                    f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;'
+                    f'padding:16px;margin:0.75rem 0 1rem">'
+                    f'<div style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;'
+                    f'letter-spacing:0.08em;margin-bottom:8px">AI Advisory Recommendation</div>'
+                    f'<div style="margin-bottom:8px">{_badge(ai_rec, ai_color)}</div>'
+                    f'<div style="color:#374151;font-size:0.92em;line-height:1.5">'
+                    f'{disp.get("ai_reasoning", "")}</div>'
+                    f'{rl_line}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                analyst_decision = disp.get("analyst_decision")
+
+                if analyst_decision:
+                    # Read-only outcome
+                    dec_color = "#16a34a" if analyst_decision == "Accepted" else "#dc2626"
+                    st.markdown(
+                        f"**Your decision:** {_badge(analyst_decision, dec_color)}",
+                        unsafe_allow_html=True,
+                    )
+                    if disp.get("analyst_notes"):
+                        st.markdown(f"**Notes:** {disp['analyst_notes']}")
+                    if analyst_decision == "Upheld" and submission.dispute_count < 2:
+                        st.info("Customer may file a second dispute.")
+                else:
+                    # Action buttons for analyst
+                    analyst_notes = st.text_area(
+                        "Analyst notes (optional)",
+                        placeholder="Add notes to accompany your decision.",
+                        key=f"dispute_notes_{i}",
+                    )
+                    col_accept, col_uphold, _ = st.columns([1.3, 1.3, 3.4])
+                    with col_accept:
+                        if st.button("Accept Customer", type="primary", key=f"accept_d{i}", use_container_width=True):
+                            fresh = load_submission(submission.id)
+                            fresh.disputes[i - 1]["analyst_decision"] = "Accepted"
+                            fresh.disputes[i - 1]["analyst_notes"]    = analyst_notes.strip()
+                            fresh.status = "approved"
+                            _append_email(
+                                fresh,
+                                "Decision Updated",
+                                f"Following your dispute, we have reviewed your application "
+                                f"(Reference ID: {fresh.id}) and are pleased to inform you that "
+                                "it has been approved. Welcome aboard.",
+                            )
+                            update_submission(fresh)
+                            st.rerun()
+                    with col_uphold:
+                        if st.button("Uphold Rejection", type="secondary", key=f"uphold_d{i}", use_container_width=True):
+                            fresh = load_submission(submission.id)
+                            fresh.disputes[i - 1]["analyst_decision"] = "Upheld"
+                            fresh.disputes[i - 1]["analyst_notes"]    = analyst_notes.strip()
+                            _disputes_remaining = max(0, 2 - fresh.dispute_count)
+                            if _disputes_remaining > 0:
+                                _append_email(
+                                    fresh,
+                                    "Dispute Outcome",
+                                    f"We have reviewed your dispute (Reference ID: {fresh.id}) "
+                                    "and unfortunately must uphold our original decision. If you "
+                                    "have additional information, you may submit a further dispute. "
+                                    f"You have {_disputes_remaining} dispute(s) remaining.",
+                                    action="dispute",
+                                )
+                            else:
+                                _append_email(
+                                    fresh,
+                                    "Dispute Outcome",
+                                    f"We have reviewed your dispute (Reference ID: {fresh.id}) "
+                                    "and unfortunately must uphold our original decision. You have "
+                                    "reached the maximum number of disputes for this application. "
+                                    "Please contact us at compliance@kycplatform.com if you have "
+                                    "further questions.",
+                                )
+                            update_submission(fresh)
+                            st.rerun()
+
+                if i < len(submission.disputes):
+                    st.markdown('<div style="border-top:1px solid #e2e8f0;margin:1rem 0"></div>', unsafe_allow_html=True)
 
     # ── List view ─────────────────────────────────────────────────────────────
 

@@ -188,53 +188,65 @@ def run_analysis(submission_id: str) -> Submission:
     return submission
 
 
-_DISPUTE_REVIEW_TOOL = {
-    "name": "submit_dispute_review",
-    "description": "Submit the outcome of a customer dispute review.",
+_DISPUTE_RECOMMENDATION_TOOL = {
+    "name": "submit_dispute_recommendation",
+    "description": (
+        "Submit an advisory recommendation on a customer dispute. "
+        "This is guidance only — the final decision is made by a human analyst."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "outcome": {
+            "recommendation": {
                 "type": "string",
-                "enum": ["Upheld", "Overturned"],
+                "enum": ["Uphold Rejection", "Overturn Rejection"],
                 "description": (
-                    "Upheld = rejection stands. "
-                    "Overturned = customer's rebuttal is accepted and rejection is reversed."
+                    "Uphold Rejection = the original rejection should stand. "
+                    "Overturn Rejection = the rebuttal is credible and the rejection should be reversed."
                 ),
             },
             "reasoning": {
                 "type": "string",
                 "description": (
-                    "Clear explanation of why the dispute was upheld or overturned. "
-                    "Reference specific points from the original risk brief and the customer's rebuttal. "
+                    "Clear explanation referencing specific points from the original risk brief "
+                    "and the customer's rebuttal. Acknowledge any supporting documents or TIN provided. "
                     "3–5 sentences."
                 ),
             },
             "revised_risk_level": {
                 "type": "string",
                 "enum": ["Low", "Medium", "High", "Critical"],
-                "description": "Revised risk level if the outcome is Overturned. Omit if Upheld.",
+                "description": "Suggested revised risk level if recommending Overturn. Omit if recommending Uphold.",
             },
         },
-        "required": ["outcome", "reasoning"],
+        "required": ["recommendation", "reasoning"],
     },
 }
 
-_DISPUTE_SYSTEM_PROMPT = """You are a senior KYC compliance analyst conducting a second-level review of a disputed rejection decision.
+_DISPUTE_SYSTEM_PROMPT = """You are a senior KYC compliance specialist providing an advisory recommendation on a disputed rejection. A human analyst will make the final decision — your role is to give a well-reasoned recommendation.
 
 You will receive:
 1. The original risk brief that led to the rejection
-2. The customer's rebuttal disputing the rejection
+2. The customer's rebuttal
+3. Tax Identification Number if provided
+4. A note of any supporting documents uploaded (you cannot read their contents — acknowledge their provision only)
 
-Your task is to objectively assess whether the customer's rebuttal provides sufficient new information or credible explanations to overturn the rejection.
+Be rigorous. A generic rebuttal should not succeed. A rebuttal that specifically addresses the flagged signals with verifiable, credible information warrants an Overturn recommendation.
 
-Be rigorous. A rebuttal should only succeed if it genuinely addresses the specific concerns raised — not merely reasserts innocence or provides vague reassurances. At the same time, if the rebuttal provides specific, credible, and verifiable information that materially changes the risk picture, you should be willing to overturn the decision.
-
-Use the submit_dispute_review tool to record your outcome."""
+Use the submit_dispute_recommendation tool to record your recommendation."""
 
 
-def review_dispute(submission_id: str, rebuttal: str) -> Submission:
-    """Run a second-level dispute review and persist the result."""
+def review_dispute(
+    submission_id: str,
+    rebuttal: str,
+    tin: str = "",
+    document_filenames: list = None,
+) -> Submission:
+    """
+    Generate an AI advisory recommendation for a customer dispute.
+    Appends the dispute to the submission's disputes list.
+    Does NOT change submission status — only the analyst can do that.
+    """
     submission = load_submission(submission_id)
     brief = submission.risk_brief or {}
 
@@ -247,12 +259,17 @@ def review_dispute(submission_id: str, rebuttal: str) -> Submission:
         for o in brief.get("osint_findings", [])
     )
 
-    user_message = f"""A customer has disputed their KYC rejection. Please review.
+    tin_line = f"\n**Tax Identification Number provided:** {tin}" if tin and tin.strip() else ""
+    docs_line = (
+        f"\n**Supporting documents uploaded:** {', '.join(document_filenames)}"
+        if document_filenames else ""
+    )
+
+    user_message = f"""A customer has disputed their KYC rejection. Please provide your advisory recommendation.
 
 **Original risk brief**
 - Risk level: {brief.get('risk_level', 'N/A')}
 - Risk score: {brief.get('risk_score', 'N/A')} / 100
-- Recommendation: {brief.get('recommendation', 'N/A')}
 - Summary: {brief.get('summary', 'N/A')}
 
 **Flagged signals:**
@@ -261,29 +278,36 @@ def review_dispute(submission_id: str, rebuttal: str) -> Submission:
 **OSINT findings:**
 {osint_text or 'None recorded.'}
 
-**Customer's rebuttal:**
-{rebuttal.strip()}
+**Customer rebuttal:**
+{rebuttal.strip()}{tin_line}{docs_line}
 
-Assess whether the rebuttal materially addresses the concerns and submit your dispute review."""
+Assess whether the rebuttal credibly addresses the concerns and submit your recommendation."""
 
     response = _client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2048,
         system=_DISPUTE_SYSTEM_PROMPT,
-        tools=[_DISPUTE_REVIEW_TOOL],
-        tool_choice={"type": "tool", "name": "submit_dispute_review"},
+        tools=[_DISPUTE_RECOMMENDATION_TOOL],
+        tool_choice={"type": "tool", "name": "submit_dispute_recommendation"},
         messages=[{"role": "user", "content": user_message}],
     )
 
     tool_block = next(b for b in response.content if b.type == "tool_use")
-    dispute = dict(tool_block.input)
-    dispute["rebuttal"] = rebuttal.strip()
-    dispute["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    rec = dict(tool_block.input)
 
-    submission.dispute = dispute
-    if dispute["outcome"] == "Overturned":
-        submission.status = "approved"
-        if submission.decision:
-            submission.decision["overturned"] = True
+    dispute = {
+        "rebuttal":           rebuttal.strip(),
+        "tin":                tin.strip() if tin else "",
+        "documents_uploaded": document_filenames or [],
+        "ai_recommendation":  rec["recommendation"],
+        "ai_reasoning":       rec["reasoning"],
+        "revised_risk_level": rec.get("revised_risk_level", ""),
+        "analyst_decision":   None,
+        "analyst_notes":      "",
+        "timestamp":          datetime.now(timezone.utc).isoformat(),
+    }
+
+    submission.disputes.append(dispute)
+    submission.dispute_count = len(submission.disputes)
     update_submission(submission)
     return submission
