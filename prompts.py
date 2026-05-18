@@ -19,7 +19,8 @@ Analyse each submission holistically. Look for inconsistencies, implausibilities
 - High volumes combined with opaque source of funds
 
 **PEP exposure**
-- Any PEP declaration raises risk to at minimum High — no exceptions
+- PEP declaration is a significant risk signal that warrants enhanced scrutiny
+- The actual risk level depends on the nature of the connection, the jurisdiction, the transaction volume, and the plausibility of the source of funds — not on PEP status alone
 - Close associates or family members of PEPs also warrant scrutiny
 
 **Geographic risk**
@@ -159,7 +160,7 @@ def build_user_message(submission: Submission, osint_summary: str = "") -> str:
     if sector_flags:
         context_lines.append(f"High-risk sector keywords detected: {', '.join(sector_flags)}")
     if submission.pep_status:
-        context_lines.append("PEP declared: Yes — risk level is at minimum High")
+        context_lines.append("PEP declared: Yes — enhanced scrutiny required")
 
     context_block = ""
     if context_lines:

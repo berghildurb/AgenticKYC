@@ -38,7 +38,7 @@ SYNTHETIC_PROFILES = [
             "Project-based consulting income from various clients across Europe. "
             "Revenue fluctuates month to month depending on active contracts."
         ),
-        "expected_transaction_volume":  "€10,000 – €50,000",
+        "expected_transaction_volume":  "€5,000 – €10,000",
         "pep_status":                   False,
         "beneficial_ownership":         "Acting on my own behalf.",
     },

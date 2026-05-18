@@ -342,8 +342,10 @@ if page == "Customer Onboarding":
             _label("Expected Monthly Transaction Volume")
             expected_transaction_volume = st.selectbox(
                 "Expected Monthly Transaction Volume",
-                ["Under €1,000", "€1,000 – €10,000", "€10,000 – €50,000",
-                 "€50,000 – €100,000", "Over €100,000"],
+                ["Under €1,000", "€1,000 – €5,000", "€5,000 – €10,000",
+                 "€10,000 – €15,000", "€15,000 – €20,000", "€20,000 – €30,000",
+                 "€30,000 – €40,000", "€40,000 – €50,000", "€50,000 – €100,000",
+                 "Over €100,000"],
                 label_visibility="collapsed",
             )
 
